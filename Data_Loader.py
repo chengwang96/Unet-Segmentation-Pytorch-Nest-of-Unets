@@ -48,7 +48,7 @@ class UNextDataset(torch.utils.data.Dataset):
         if mask.max()<1:
             mask[mask>0] = 1.0
 
-        return img, mask
+        return img, mask, img_id
 
 
 class Images_Dataset(Dataset):

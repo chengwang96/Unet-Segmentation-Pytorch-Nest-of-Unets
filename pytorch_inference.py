@@ -9,6 +9,7 @@ from torch import optim
 import torch.utils.data
 import torch
 import torch.nn.functional as F
+from collections import OrderedDict
 
 import torch.nn
 import torchvision
@@ -82,9 +83,8 @@ def parse_args():
     parser.add_argument('--dataseed', default=2981, type=int)
     parser.add_argument('--input_size', default=256, type=int)
     parser.add_argument('--batch_size', default=8, type=int)
-    parser.add_argument('--epoch', default=400, type=int)
     parser.add_argument('--dataset', default='busi', type=str)
-    parser.add_argument('--initial_lr', default=1e-4, type=float)
+    parser.add_argument('--log_dir', type=str)
     
     config = parser.parse_args()
 
@@ -118,15 +118,10 @@ device = torch.device("cuda:0" if train_on_gpu else "cpu")
 #Setting the basic paramters of the model
 #######################################################
 
-batch_size = config.batch_size
-epoch = config.epoch
 shuffle = True
 valid_loss_min = np.Inf
-num_workers = config.batch_size
-lossT = []
-lossL = []
-lossL.append(np.inf)
-lossT.append(np.inf)
+batch_size = config.batch_size
+num_workers = batch_size
 n_iter = 1
 
 pin_memory = False
@@ -149,34 +144,6 @@ def model_unet(model_input, in_channel=3, out_channel=1):
 
 model_test = model_unet(model_Inputs[model_id], 3, 1)
 model_test.to(device)
-
-from pdb import set_trace as st
-from thop import profile
-import time 
-
-def count_parameters(model_test):
-    return sum(p.numel() for p in model_test.parameters() if p.requires_grad)
-
-params = count_parameters(model_test)
-params_in_million = params / 1e6
-print(f"模型参数量：{params_in_million} 百万")
-
-model_test.eval()
-input_tensor = torch.randn(config.batch_size, 3, config.input_size, config.input_size).cuda()
-# 将输入传递给模型并测量推理时间
-with torch.no_grad():
-    start_time = time.time()
-    output = model_test(input_tensor)
-    end_time = time.time()
-# 计算推理时间
-inference_time_ms = (end_time - start_time) * 1000
-print(f"推理时间：{inference_time_ms} 毫秒")
-
-# 运行模型并测量GFLOPs
-with torch.no_grad():
-    flops, _ = profile(model_test, inputs=(input_tensor,))
-    gflops = flops / 1e9
-    print(f"GFLOPs：{gflops} G")
 
 #######################################################
 #Passing the Dataset of Images and Labels
@@ -259,141 +226,27 @@ val_loader = torch.utils.data.DataLoader(
     drop_last=False)
 
 #######################################################
-#Using Adam as Optimizer
-#######################################################
-
-initial_lr = 0.001
-opt = torch.optim.Adam(model_test.parameters(), lr=initial_lr) # try SGD
-#opt = optim.SGD(model_test.parameters(), lr = initial_lr, momentum=0.99)
-
-MAX_STEP = int(1e10)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, MAX_STEP, eta_min=1e-5)
-#scheduler = optim.lr_scheduler.CosineAnnealingLr(opt, epoch, 1)
-
-#######################################################
 #Creating a Folder for every data of the program
 #######################################################
 
-now = datetime.datetime.now()
-formatted_time = now.strftime("%m%d%H%M")
-New_folder = './output/{}_{}_{}_{}'.format(model_name, dataset_name, dataseed, formatted_time)
+file_list = os.listdir(config.log_dir)
+for file in file_list:
+    model_dir = os.path.join(config.log_dir, file)
+    if os.path.isdir(model_dir):
+        break
 
-if os.path.exists(New_folder) and os.path.isdir(New_folder):
-    import ipdb; ipdb.set_trace()
+file_list = os.listdir(model_dir)
+for file in file_list:
+    model_path = os.path.join(model_dir, file)
+    if 'pth' in file:
+        break
 
-try:
-    os.mkdir(New_folder)
-except OSError:
-    print("Creation of the main directory '%s' failed " % New_folder)
-else:
-    print("Successfully created the main directory '%s' " % New_folder)
-
-my_writer = SummaryWriter(New_folder)
-
-#######################################################
-#checking if the model exists and if true then delete
-#######################################################
-
-read_model_path = os.path.join(New_folder, 'Unet_D_' + str(epoch) + '_' + str(batch_size))
-
-if os.path.exists(read_model_path) and os.path.isdir(read_model_path):
-    shutil.rmtree(read_model_path)
-    print('Model folder there, so deleted for newer one')
-
-try:
-    os.mkdir(read_model_path)
-except OSError:
-    print("Creation of the model directory '%s' failed" % read_model_path)
-else:
-    print("Successfully created the model directory '%s' " % read_model_path)
-
-#######################################################
-#Training loop
-#######################################################
-
-for i in range(epoch):
-    train_loss = 0.0
-    valid_loss = 0.0
-    since = time.time()
-    scheduler.step(i)
-    lr = scheduler.get_lr()
-
-    #######################################################
-    #Training Data
-    #######################################################
-
-    model_test.train()
-    k = 1
-
-    for x, y, img_ids in train_loader:
-        x, y = x.to(device), y.to(device)
-
-        #If want to get the input images with their Augmentation - To check the data flowing in net
-        # input_images(x, y, i, n_iter, k)
-
-        opt.zero_grad()
-
-        y_pred = model_test(x)
-        lossT = calc_loss(y_pred, y)     # Dice_loss Used
-
-        train_loss += lossT.item() * x.size(0)
-        lossT.backward()
-        opt.step()
-        x_size = lossT.item() * x.size(0)
-        k = 2
-
-    #######################################################
-    #Validation Step
-    #######################################################
-
-    model_test.eval()
-
-    iou_avg_meter = AverageMeter()
-    dice_avg_meter = AverageMeter()
-    hd95_avg_meter = AverageMeter()
-    with torch.no_grad():
-        for x1, y1, img_ids in val_loader:
-            x1, y1 = x1.to(device), y1.to(device)
-
-            y_pred1 = model_test(x1)
-            lossL = calc_loss(y_pred1, y1)
-            iou, dice, hd95_ = iou_score(y_pred1, y1)
-            iou_avg_meter.update(iou, x1.size(0))
-            dice_avg_meter.update(dice, x1.size(0))
-            hd95_avg_meter.update(hd95_, x1.size(0))
-
-            valid_loss += lossL.item() * x1.size(0)
-            x_size1 = lossL.item() * x1.size(0)
-        
-        del lossL, y_pred1, x1, y1
-        
-    train_loss = train_loss / len(train_dataset)
-    valid_loss = valid_loss / len(val_dataset)
-
-    my_writer.add_scalar('train/loss', train_loss, global_step=i)
-    my_writer.add_scalar('valid/loss', valid_loss, global_step=i)
-    my_writer.add_scalar('valid/iou', iou_avg_meter.avg, global_step=i)
-    my_writer.add_scalar('valid/dice', dice_avg_meter.avg, global_step=i)
-
-    if (i+1) % 1 == 0:
-        print('Epoch: {}/{} \tTraining Loss: {:.6f} \tValidation Loss: {:.6f}'.format(i + 1, epoch, train_loss, valid_loss))
-
-    if valid_loss <= valid_loss_min:
-        print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model '.format(valid_loss_min, valid_loss))
-        torch.save(model_test.state_dict(), os.path.join(New_folder, 'Unet_D_' + str(epoch) + '_' + str(batch_size), 'Unet_epoch_' + str(epoch) + '_batchsize_' + str(batch_size) + '.pth'))
-
-        valid_loss_min = valid_loss
-
-        print(model_name)
-        print('IoU: %.4f' % iou_avg_meter.avg)
-        print('Dice: %.4f' % dice_avg_meter.avg)
-        print('HD95: %.4f' % hd95_avg_meter.avg)
-
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-
-model_test.load_state_dict(torch.load(os.path.join(New_folder, 'Unet_D_' + str(epoch) + '_' + str(batch_size), 'Unet_epoch_' + str(epoch) + '_batchsize_' + str(batch_size) + '.pth')))
-
+ckpt = torch.load(model_path)
+new_state_dict = OrderedDict()
+for k, v in ckpt.items():
+    if not 'total_ops' in k and not 'total_params' in k:  
+        new_state_dict[k] = v
+model_test.load_state_dict(new_state_dict)
 model_test.eval()
 
 iou_avg_meter = AverageMeter()
@@ -405,7 +258,7 @@ with torch.no_grad():
         x1, y1 = x1.to(device), y1.to(device)
         y_pred1 = model_test(x1)
         iou, dice, hd95_ = iou_score(y_pred1, y1)
-        y_pred1[y_pred1>0.5] = 255
+        y_pred1[y_pred1>0.5] = 1
         y_pred1[y_pred1<=0.5] = 0
 
         for pred, img_id in zip(y_pred1, img_ids):
@@ -413,7 +266,7 @@ with torch.no_grad():
             pred_np = pred_np.astype(np.uint8)
             pred_np = pred_np * 255
             img = Image.fromarray(pred_np, 'L')
-            img.save(os.path.join(New_folder, '{}.png'.format(img_id)))
+            img.save(os.path.join(config.log_dir, '{}.png'.format(img_id)))
 
         iou_avg_meter.update(iou, x1.size(0))
         dice_avg_meter.update(dice, x1.size(0))
@@ -424,15 +277,12 @@ print('IoU: %.4f' % iou_avg_meter.avg)
 print('Dice: %.4f' % dice_avg_meter.avg)
 print('HD95: %.4f' % hd95_avg_meter.avg)
 
-my_writer.add_scalar('test/iou', iou_avg_meter.avg, global_step=i)
-my_writer.add_scalar('test/dice', dice_avg_meter.avg, global_step=i)
-
 with torch.no_grad():
     for x1, y1, img_ids in train_loader:
         x1, y1 = x1.to(device), y1.to(device)
         y_pred1 = model_test(x1)
         iou, dice, hd95_ = iou_score(y_pred1, y1)
-        y_pred1[y_pred1>0.5] = 255
+        y_pred1[y_pred1>0.5] = 1
         y_pred1[y_pred1<=0.5] = 0
 
         for pred, img_id in zip(y_pred1, img_ids):
@@ -440,7 +290,7 @@ with torch.no_grad():
             pred_np = pred_np.astype(np.uint8)
             pred_np = pred_np * 255
             img = Image.fromarray(pred_np, 'L')
-            img.save(os.path.join(New_folder, '{}.png'.format(img_id)))
+            img.save(os.path.join(config.log_dir, '{}.png'.format(img_id)))
 
         iou_avg_meter.update(iou, x1.size(0))
         dice_avg_meter.update(dice, x1.size(0))
